@@ -1,0 +1,163 @@
+#include <Wire.h>
+
+void setup(){
+  Serial1.begin(115200);
+  Serial.begin(115200);
+
+  Wire.begin();
+  Wire.setClock(400000);
+
+  Wire.beginTransmission(0x68);
+  Wire.write(0x6b);
+  Wire.write(0x0);
+  Wire.endTransmission(true);
+}
+
+int throttle = 0;
+void loop(){
+  Wire.beginTransmission(0x68);
+  Wire.write(0x43);
+  Wire.endTransmission(false);
+  Wire.requestFrom(0x68, 6, true);
+  
+  int16_t GyXH = Wire.read();
+  int16_t GyXL = Wire.read();
+  int16_t GyYH = Wire.read();
+  int16_t GyYL = Wire.read();
+  int16_t GyZH = Wire.read();
+  int16_t GyZL = Wire.read();
+
+  int16_t GyX = GyXH << 8 | GyXL;
+  int16_t GyY = GyYH << 8 | GyYL;
+  int16_t GyZ = GyZH << 8 | GyZL;
+
+  static int32_t GyXSum = 0, GyYSum = 0, GyZSum=0;
+  static double GyXoff = 0.0, GyYoff = 0.0, GyZoff = 0.0;
+  static int cnt_sample = 1000;
+  if(cnt_sample > 0){
+    GyXSum += GyX, GyYSum += GyY, GyZSum += GyZ;
+    cnt_sample--;
+    if(cnt_sample == 0){
+      GyXoff = GyXSum / 1000.0;
+      GyYoff = GyYSum / 1000.0;
+      GyZoff = GyZSum / 1000.0;
+    }
+    delay(1);
+    return;
+  }
+  double GyXD = GyX - GyXoff;
+  double GyYD = GyY - GyYoff;
+  double GyZD = GyZ - GyZoff;
+  double GyXR = GyXD / 131.0;
+  double GyYR = GyYD / 131.0;
+  double GyZR = GyZD / 131.0;
+
+  static unsigned long t_prev = 0;
+  unsigned long t_now = micros();
+  double dt = (t_now - t_prev)/1000000.0;
+  t_prev = t_now;
+
+  static double AngleX = 0.0, AngleY = 0.0, AngleZ = 0.0;
+  AngleX += GyXR * dt;
+  AngleY += GyYR * dt;
+  AngleZ += GyZR * dt;
+  if(throttle == 0){
+    AngleX = AngleY = AngleZ = 0.0;
+  }
+
+  static double tAngleX = 0.0, tAngleY = 0.0, tAngleZ = 0.0;
+
+  // --- [핵심 수정: 심한 왼쪽 쏠림 영점 보정] ---
+  // 오른쪽 키('d')를 눌러야 수평이 맞는다면, 드론이 기본적으로 오른쪽(+ 값)으로 
+  // 강하게 보상하도록 해야 합니다. 기존 -3.0에서 양수인 +10.0으로 확 올렸습니다.
+  double trimX = 10.0; 
+  double trimY = 0.0;  
+  // ---------------------------------------------
+  
+  double eAngleX = (tAngleX + trimX) - AngleX;
+  double eAngleY = (tAngleY + trimY) - AngleY;
+  double eAngleZ = tAngleZ - AngleZ;
+  
+  double kp = 1.0; 
+  double BalX = kp * eAngleX;
+  double BalY = kp * eAngleY;
+  double BalZ = kp * eAngleZ;
+
+  double kd = 1.0; 
+  BalX += kd *-GyXR;
+  BalY += kd *-GyYR;
+  BalZ += kd *-GyZR;
+  if(throttle == 0){
+    BalX = BalY = BalZ = 0.0;
+  }
+
+  // 시간이 지날수록 앞으로 쏠리는 현상 방지용 (유지)
+  double ki = 0.0; 
+  
+  static double ResX = 0.0, ResY = 0.0, ResZ = 0.0;
+  ResX += ki * eAngleX * dt;
+  ResY += ki * eAngleY * dt;
+  ResZ += ki * eAngleZ * dt;
+
+  ResX = constrain(ResX, -50.0, 50.0);
+  ResY = constrain(ResY, -50.0, 50.0);
+  ResZ = constrain(ResZ, -50.0, 50.0);
+
+  if(throttle == 0){
+    ResX = ResY = ResZ = 0.0;
+  }
+  BalX += ResX;
+  BalY += ResY;
+  BalZ += ResZ;
+
+  // 블루투스 조종
+  if(Serial1.available() > 0){
+    while(Serial1.available() > 0){
+      char userInput = Serial1.read();
+      
+      if(userInput >= '0' && userInput <= '9'){
+        throttle = (userInput - '0') * 25;
+      }
+      else if(userInput == 'w'){ tAngleY += 15.0; } 
+      else if(userInput == 's'){ tAngleY -= 20.0; } // 후진 파워 상향 유지
+      else if(userInput == 'a'){ tAngleX -= 15.0; } 
+      else if(userInput == 'd'){ tAngleX += 15.0; } 
+      else if(userInput == 'q'){ tAngleZ -= 15.0; } 
+      else if(userInput == 'e'){ tAngleZ += 15.0; } 
+      else if(userInput == 'h'){ tAngleX = 0.0; tAngleY = 0.0; }
+    }
+  }
+
+  // PC 시리얼 조종 (블루투스와 파워 수치 완벽 동기화)
+  if(Serial.available() > 0){
+    while(Serial.available() > 0){
+      char userInput = Serial.read();
+      
+      if(userInput >= '0' && userInput <= '9'){
+        throttle = (userInput - '0') * 25;
+      }
+      else if(userInput == 'w'){ tAngleY += 15.0; } 
+      else if(userInput == 's'){ tAngleY -= 20.0; } // 후진 파워 상향 동기화
+      else if(userInput == 'a'){ tAngleX -= 15.0; } 
+      else if(userInput == 'd'){ tAngleX += 15.0; } 
+      else if(userInput == 'q'){ tAngleZ -= 15.0; } 
+      else if(userInput == 'e'){ tAngleZ += 15.0; } 
+      else if(userInput == 'h'){ tAngleX = 0.0; tAngleY = 0.0; }
+    }
+  }
+
+  double speedA = throttle + BalY + BalX + BalZ;
+  double speedB = throttle - BalY + BalX - BalZ;
+  double speedC = throttle - BalY - BalX + BalZ;
+  double speedD = throttle + BalY - BalX - BalZ;
+
+  int iSpeedA = constrain((int)speedA, 0, 250);
+  int iSpeedB = constrain((int)speedB, 0, 250);
+  int iSpeedC = constrain((int)speedC, 0, 250);
+  int iSpeedD = constrain((int)speedD, 0, 250);
+
+  analogWrite(6, iSpeedA);
+  analogWrite(10, iSpeedB);
+  analogWrite(9, iSpeedC);
+  analogWrite(5, iSpeedD);
+}

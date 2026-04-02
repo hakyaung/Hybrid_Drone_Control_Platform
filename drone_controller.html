@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>FPV 드론 하이브리드 조종석 Pro</title>
+    <style>
+        body { font-family: 'Malgun Gothic', sans-serif; text-align: center; margin-top: 30px; background-color: #1e272e; color: white; }
+        .container { max-width: 850px; margin: 0 auto; padding: 20px; }
+        .btn-group { margin-bottom: 20px; }
+        button { padding: 15px 25px; font-size: 16px; cursor: pointer; color: white; border: none; border-radius: 5px; font-weight: bold; transition: 0.2s; margin: 5px; }
+        button:hover { filter: brightness(1.1); }
+        
+        #connectBtn { background-color: #0fb9b1; }
+        #connectWsBtn { background-color: #8854d0; }
+        #sendDbBtn { background-color: #f7b731; color: black; } 
+        #downloadCsvBtn { background-color: #34495e; margin-top: 10px; width: 100%; }
+        
+        #status { font-size: 20px; margin: 15px; font-weight: bold; color: #f39c12; }
+        
+        .panel { background-color: #2f3640; padding: 20px; border-radius: 10px; margin-top: 20px; border: 1px solid #7f8fa6; text-align: left; }
+        .panel h3 { margin-top: 0; color: #f1c40f; text-align: center; }
+        .panel p { margin: 8px 0; font-size: 15px; color: #d2dae2; }
+        .highlight { color: #ff3838; font-weight: bold; }
+        .throttle-highlight { color: #0fb9b1; font-weight: bold; }
+        
+        .mode-btn { background-color: #7f8fa6; width: 45%; }
+        .active-mode { background-color: #fc5c65 !important; box-shadow: 0 0 15px #fc5c65; }
+        
+        .telemetry { display: flex; justify-content: space-around; margin-top: 15px; background: #171c24; padding: 10px; border-radius: 5px; }
+        .val-box { font-family: 'Consolas', monospace; font-size: 18px; color: #2ecc71; }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h1>🚁 하이브리드 드론 GCS (지상관제소) Pro</h1>
+        
+        <div class="btn-group">
+            <button id="connectBtn">1️⃣ 드론 블루투스 연결 (HM-10)</button>
+            <button id="connectWsBtn">2️⃣ 파이썬 AI 비전 연동</button>
+            <button id="sendDbBtn">💾 비행 로그 DB 저장</button>
+        </div>
+        
+        <div id="status">상태: 연결 대기 중...</div>
+
+        <div class="panel" style="text-align: center;">
+            <h3>🎮 조종 모드 선택</h3>
+            <button id="manualModeBtn" class="mode-btn active-mode">⌨️ 수동 키보드 모드</button>
+            <button id="visionModeBtn" class="mode-btn">👁️ AI 비전 모드</button>
+            <p id="modeDesc" style="color: #2ecc71; margin-top: 15px; font-weight: bold;">현재: 키보드로 조종합니다.</p>
+        </div>
+
+        <div class="panel">
+            <h3>[ Pro 실시간 조종 가이드 ]</h3>
+            <p>베이스 고도 설정: <b>숫자 1 ~ 9</b> (<span class="highlight">0: 긴급 정지</span>)</p>
+            <p>고도 미세 조정: <span class="throttle-highlight">U (상승)</span> / <span class="throttle-highlight">J (하강)</span> <small>(1단계씩 정밀 조정)</small></p>
+            <hr style="border: 0.5px solid #57606f; margin: 10px 0;">
+            <p>앞/뒤 이동: <b>W / S</b> &nbsp;&nbsp;|&nbsp;&nbsp; 좌/우 이동: <b>A / D</b></p>
+            <p>제자리 회전(Yaw): <b>Q (좌) / E (우)</b></p> 
+            <p>수평 복귀(Hover): <b>H</b> <small>(또는 방향키를 떼면 자동 복귀)</small></p>
+            
+            <div class="telemetry">
+                <div>최근 명령: <span id="lastCmdDisplay" class="val-box">-</span></div>
+            </div>
+        </div>
+
+        <button id="downloadCsvBtn">📊 비행 로그 CSV 다운로드</button>
+    </div>
+
+    <script>
+        let bleCharacteristic;
+        let activeKeys = new Set();
+        let flightLogs = [];
+        let startTime = 0;
+        
+        let controlMode = 'MANUAL'; 
+        let pythonWs = null;
+
+        document.getElementById('connectBtn').addEventListener('click', async () => {
+            try {
+                const device = await navigator.bluetooth.requestDevice({ filters: [{ services: [0xFFE0] }] });
+                const server = await device.gatt.connect();
+                const service = await server.getPrimaryService(0xFFE0);
+                bleCharacteristic = await service.getCharacteristic(0xFFE1); 
+                
+                document.getElementById('status').innerHTML = '상태: 🟢 드론 연결 완료!';
+                document.getElementById('status').style.color = '#2ecc71';
+
+                startTime = Date.now(); 
+                flightLogs.push({ time: 0, command: 'BLE_CONNECT' });
+            } catch (error) {
+                alert("연결 실패: " + error);
+            }
+        });
+
+        document.getElementById('connectWsBtn').addEventListener('click', () => {
+            pythonWs = new WebSocket('ws://localhost:8765');
+            pythonWs.onopen = () => {
+                document.getElementById('connectWsBtn').innerText = "🟢 파이썬 연동됨";
+                document.getElementById('connectWsBtn').style.backgroundColor = '#2ecc71';
+            };
+            pythonWs.onmessage = (event) => {
+                if (controlMode === 'VISION') {
+                    const msg = event.data;
+                    const val = msg.includes(':') ? msg.split(':')[1] : msg;
+                    if (val) sendBleData(val);
+                }
+            };
+        });
+
+        document.getElementById('manualModeBtn').addEventListener('click', () => {
+            controlMode = 'MANUAL';
+            document.getElementById('manualModeBtn').classList.add('active-mode');
+            document.getElementById('visionModeBtn').classList.remove('active-mode');
+            document.getElementById('modeDesc').innerText = "현재: 키보드(W,A,S,D,Q,E,U,J)로 조종합니다.";
+            document.getElementById('modeDesc').style.color = "#2ecc71";
+        });
+
+        document.getElementById('visionModeBtn').addEventListener('click', () => {
+            if(!pythonWs || pythonWs.readyState !== WebSocket.OPEN) {
+                alert("파이썬 AI를 먼저 연동해주세요!");
+                return;
+            }
+            controlMode = 'VISION';
+            document.getElementById('visionModeBtn').classList.add('active-mode');
+            document.getElementById('manualModeBtn').classList.remove('active-mode');
+            document.getElementById('modeDesc').innerText = "현재: 파이썬 AI 비전 모드 활성화";
+            document.getElementById('modeDesc').style.color = "#fc5c65";
+        });
+
+        const validKeys = ['0','1','2','3','4','5','6','7','8','9','w','a','s','d','q','e','h','u','j'];
+
+        window.addEventListener('keydown', (event) => {
+            if (controlMode !== 'MANUAL') return;
+            const key = event.key.toLowerCase();
+            
+            if (['w','a','s','d','q','e'].includes(key)) {
+                if (!activeKeys.has(key)) {
+                    activeKeys.add(key);
+                    sendBleData(key);
+                }
+            } 
+            else if (['u','j'].includes(key)) {
+                sendBleData(key);
+            }
+            else if (validKeys.includes(key)) {
+                sendBleData(key);
+            }
+        });
+
+        window.addEventListener('keyup', (event) => {
+            if (controlMode !== 'MANUAL') return;
+            const key = event.key.toLowerCase();
+            activeKeys.delete(key);
+
+            if (['w', 'a', 's', 'd'].includes(key)) {
+                sendBleData('h'); 
+            }
+        });
+
+        async function sendBleData(data) {
+            if(!bleCharacteristic) return;
+            try {
+                let encoder = new TextEncoder();
+                await bleCharacteristic.writeValueWithoutResponse(encoder.encode(data));
+                
+                document.getElementById('lastCmdDisplay').innerText = data.toUpperCase();
+                flightLogs.push({ time: Date.now() - startTime, command: data });
+            } catch (e) {
+                console.log("전송 지연");
+            }
+        }
+
+        // 💡 대시보드 호환성을 위해 CSV 헤더를 소문자로 통일 (time_ms, command)
+        document.getElementById('downloadCsvBtn').addEventListener('click', () => {
+            if(flightLogs.length === 0) return alert("기록 없음");
+            let csv = "time_ms,command\n" + flightLogs.map(r => `${r.time},${r.command}`).join("\n");
+            const link = document.createElement("a");
+            link.href = "data:text/csv;charset=utf-8," + encodeURI(csv);
+            link.download = "drone_pro_log.csv";
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        });
+
+        document.getElementById('sendDbBtn').addEventListener('click', () => {
+            if(flightLogs.length === 0 || !pythonWs) return alert("데이터 또는 AI 연동 없음. 단독 모드일 경우 CSV 다운로드를 이용하세요.");
+            pythonWs.send(JSON.stringify({ type: 'LOG_DATA', sessionId: startTime, logs: flightLogs }));
+            alert("DB 저장 완료!");
+        });
+    </script>
+</body>
+</html>
